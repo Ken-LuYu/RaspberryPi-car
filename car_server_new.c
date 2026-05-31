@@ -9,8 +9,10 @@
 #include <time.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
 #include <wiringPi.h>
 #include <softPwm.h>
+#include <math.h>
 
 #define PIN_BASE 300
 #define MAX_PWM 4096
@@ -27,35 +29,81 @@ int PWMB = 4;
 int BIN2 = 5;
 int BIN1 = 6;
 
-// 循迹传感器引脚
+// 循迹传感器引脚定义
 #define LEFT    23
 #define RIGHT   25
+#define B2      26
+#define B3      27
+#define B1      15
+#define B4      16
+// 自动模式定义
+#define AUTO_MODE_STOP      0
+#define AUTO_MODE_GOTO_END  1
+#define AUTO_MODE_RETURN    2
 
-// 控制模式：0=手动TCP控制，1=自动循迹模式（带途径点）
+// 节点处理状态机
+#define NODE_STATE_IDLE     0
+#define NODE_STATE_WAITING  1
+#define NODE_STATE_PROCESS  2
+#define NODE_STATE_LEAVING  3
+
+// 控制模式：0=手动TCP控制，1=自动循迹模式
 int control_mode = 0;
 // 自动循迹相关变量
-int auto_point_num = 0;    // 途径点数量
-int auto_node_cnt = 0;     // 节点计数
-int auto_node_lock = 0;    // 节点锁（防止重复计数）
-int auto_trace_running = 0;// 自动循迹运行标志
+int auto_mode = AUTO_MODE_STOP;
+int auto_point_num = 0;
+int auto_node_cnt = 0;
+int auto_node_lock = 0;
+int auto_trace_running = 0;
 
-// 云台角度变量（初始值）
-float lr_detection = 90;   // 水平云台初始角度（中间位置）
-float qh_detection = 0;    // 垂直云台初始角度（水平位置）
+// 云台自动扫描相关变量
+float servo_h_init = 90.0f;
+float servo_v_init = 0.0f;
+int servo_v_step = 10;
+int scan_total_rounds = 0;
+int scan_current_round = 0;
+float current_servo_v = 0.0f;
 
-/**
- * Calculate the number of ticks the signal should be high for the required amount of time
- */
+// 云台角度变量（输入值，与上位机一致）
+float lr_detection = 90;   // 水平：0=左 90=中 180=右
+float qh_detection = 90;    // 垂直：0=垂直向下（贴地面） 90=水平向前
+
+// 非阻塞延时相关变量
+unsigned long delay_start_time = 0;
+unsigned long delay_duration = 0;
+int delay_in_progress = 0;
+
+// 节点处理状态变量
+int node_state = NODE_STATE_IDLE;
+int current_node_type = 0; // 0=去程, 1=回程
+int current_sockfd = -1;
+
+// 全局客户端socket
+int global_client_fd = -1;
+
 int calcTicks(float impulseMs, int hertz)
 {
     float cycleMs = 1000.0f / hertz;
     return (int)(MAX_PWM * impulseMs / cycleMs + 0.5f);
 }
 
+/**
+ * 已修复云台角度映射
+ * 水平：输入0-180 → 实际舵机180-0（反转方向）
+ * 垂直：输入0-90 → 实际舵机90-0（0=向下，90=向前）
+ */
 void PWM_write(int servonum, float x)
 {
     float y;
     int tick;
+
+    if (servonum == 1) { // 水平云台（1号舵机）
+        x = 180.0f - x;
+    }
+    else if (servonum == 2) { // 垂直云台（2号舵机）
+        x = 90.0f - x;
+    }
+
     y = x / 90.0 + 0.5;
     y = max(y, 0.5);
     y = min(y, 2.5);
@@ -63,8 +111,7 @@ void PWM_write(int servonum, float x)
     pwmWrite(PIN_BASE + servonum, tick);
 }
 
-// 小车运动控制函数
-void  t_up(unsigned int speed, unsigned int t_time)
+void t_up(unsigned int speed, unsigned int t_time)
 {
     digitalWrite(AIN2, 0);
     digitalWrite(AIN1, 1);
@@ -72,7 +119,12 @@ void  t_up(unsigned int speed, unsigned int t_time)
     digitalWrite(BIN2, 0);
     digitalWrite(BIN1, 1);
     softPwmWrite(PWMB, speed);
-    delay(t_time);
+
+    if (t_time > 0) {
+        delay_start_time = millis();
+        delay_duration = t_time;
+        delay_in_progress = 1;
+    }
 }
 
 void t_stop(unsigned int t_time)
@@ -83,7 +135,12 @@ void t_stop(unsigned int t_time)
     digitalWrite(BIN2, 0);
     digitalWrite(BIN1, 0);
     softPwmWrite(PWMB, 0);
-    delay(t_time);
+
+    if (t_time > 0) {
+        delay_start_time = millis();
+        delay_duration = t_time;
+        delay_in_progress = 1;
+    }
 }
 
 void t_down(unsigned int speed, unsigned int t_time)
@@ -94,7 +151,12 @@ void t_down(unsigned int speed, unsigned int t_time)
     digitalWrite(BIN2, 1);
     digitalWrite(BIN1, 0);
     softPwmWrite(PWMB, speed);
-    delay(t_time);
+
+    if (t_time > 0) {
+        delay_start_time = millis();
+        delay_duration = t_time;
+        delay_in_progress = 1;
+    }
 }
 
 void t_left(unsigned int speed, unsigned int t_time)
@@ -105,7 +167,12 @@ void t_left(unsigned int speed, unsigned int t_time)
     digitalWrite(BIN2, 0);
     digitalWrite(BIN1, 1);
     softPwmWrite(PWMB, speed);
-    delay(t_time);
+
+    if (t_time > 0) {
+        delay_start_time = millis();
+        delay_duration = t_time;
+        delay_in_progress = 1;
+    }
 }
 
 void t_right(unsigned int speed, unsigned int t_time)
@@ -116,90 +183,354 @@ void t_right(unsigned int speed, unsigned int t_time)
     digitalWrite(BIN2, 1);
     digitalWrite(BIN1, 0);
     softPwmWrite(PWMB, speed);
-    delay(t_time);
+
+    if (t_time > 0) {
+        delay_start_time = millis();
+        delay_duration = t_time;
+        delay_in_progress = 1;
+    }
 }
 
-// 发送节点数据到上位机
+// 非阻塞延时处理函数
+int process_delay()
+{
+    if (delay_in_progress && (millis() - delay_start_time >= delay_duration)) {
+        delay_in_progress = 0;
+        return 1; // 延时完成
+    }
+    return 0; // 延时中
+}
+
+// 设置TCP_NODELAY彻底解决粘包问题
+void set_tcp_nodelay(int sockfd)
+{
+    int flag = 1;
+    if (setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(int)) < 0) {
+        printf("[TCP] 设置TCP_NODELAY失败\n");
+    }
+    else {
+        printf("[TCP] TCP_NODELAY已启用，彻底解决粘包问题\n");
+    }
+}
+
+// 安全发送函数
+void safe_send(int sockfd, const char* data)
+{
+    if (sockfd < 0) return;
+    write(sockfd, data, strlen(data));
+    usleep(100000); // 100ms延时确保数据包单独发送
+    printf("[TCP] 发送：%s\n", data);
+}
+
 void send_node_data(int sockfd, int node_code)
 {
     char buf[32];
     snprintf(buf, sizeof(buf), "NODE:0x%02X", node_code);
-    write(sockfd, buf, strlen(buf));
-    printf("[TCP] 发送节点数据：%s\n", buf);
+    safe_send(sockfd, buf);
 }
 
-// 自动循迹逻辑函数（已优化）
-void track_run(int sockfd)
+void send_scan_status(int sockfd, const char* status)
 {
-    int SR, SL;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "SCAN:%s", status);
+    safe_send(sockfd, buf);
+}
+
+// 发送自动截图指令
+void send_capture_command(int sockfd, const char* node_name, float v_angle, float h_angle)
+{
+    char buf[128];
+    snprintf(buf, sizeof(buf), "CAPTURE:AUTO:%s:%.1f:%.1f", node_name, v_angle, h_angle);
+    safe_send(sockfd, buf);
+}
+
+void set_servo_angle(float h_angle, float v_angle)
+{
+    lr_detection = h_angle;
+    qh_detection = v_angle;
+    PWM_write(1, lr_detection);
+    PWM_write(2, qh_detection);
+    printf("[SERVO] 设置云台角度：水平%.1f°，垂直%.1f°\n", h_angle, v_angle);
+}
+
+void start_next_trace(int sockfd)
+{
+    if (scan_current_round >= scan_total_rounds) {
+        send_scan_status(sockfd, "COMPLETE");
+        printf("[SCAN] 所有扫描任务完成，小车停止\n");
+        auto_trace_running = 0;
+        auto_mode = AUTO_MODE_STOP;
+        control_mode = 0;
+        t_stop(0);
+        return;
+    }
+
+    scan_current_round++;
+    printf("[SCAN] 开始第%d次扫描，总次数：%d\n", scan_current_round, scan_total_rounds);
+
+    // 计算本次循迹的垂直角度
+    if (scan_current_round == 1) {
+        current_servo_v = servo_v_init;
+    }
+    else {
+        float next_v = current_servo_v + servo_v_step;
+        if (fabs(next_v - 90.0f) < 0.001f) {
+            current_servo_v = 90.0f;
+            printf("[SERVO] 步进后正好90度，使用90度\n");
+        }
+        else if (next_v > 90.0f) {
+            current_servo_v = 85.0f;
+            printf("[SERVO] 步进后%.1f°超过90度，使用85度\n", next_v);
+        }
+        else {
+            current_servo_v = next_v;
+            printf("[SERVO] 正常步进至%.1f°\n", current_servo_v);
+        }
+    }
+
+    // 设置云台角度
+    set_servo_angle(servo_h_init, current_servo_v);
+
+    // 奇数次：去程；偶数次：回程
+    if (scan_current_round % 2 == 1) {
+        auto_mode = AUTO_MODE_GOTO_END;
+        send_scan_status(sockfd, "GOING");
+        printf("[SCAN] 第%d次：去程开始\n", scan_current_round);
+    }
+    else {
+        auto_mode = AUTO_MODE_RETURN;
+        send_scan_status(sockfd, "RETURNING");
+        printf("[SCAN] 第%d次：回程开始\n", scan_current_round);
+    }
+
+    // 启动循迹
+    auto_trace_running = 1;
+    auto_node_cnt = 0;
+    auto_node_lock = 0;
+    node_state = NODE_STATE_IDLE;
+    control_mode = 1;
+}
+
+// 处理去程节点
+void process_forward_node(int sockfd)
+{
+    if (auto_node_cnt == 1) {
+        // 起点
+        send_node_data(sockfd, 0x19);
+        send_capture_command(sockfd, "起点", current_servo_v, servo_h_init);
+        printf("[TRACK] 到达起点，计数：%d\n", auto_node_cnt);
+    }
+    else if (auto_node_cnt >= 2 && auto_node_cnt <= (auto_point_num + 1)) {
+        // 途径点
+        int point_num = auto_node_cnt - 1;
+        send_node_data(sockfd, 0x20 + point_num);
+        char node_name[32];
+        snprintf(node_name, sizeof(node_name), "途径点%d", point_num);
+        send_capture_command(sockfd, node_name, current_servo_v, servo_h_init);
+        printf("[TRACK] 到达途径点%d，计数：%d\n", point_num, auto_node_cnt);
+    }
+    else if (auto_node_cnt == (auto_point_num + 2)) {
+        // 终点
+        send_node_data(sockfd, 0x20);
+        send_capture_command(sockfd, "终点", current_servo_v, servo_h_init);
+        printf("[TRACK] 到达终点，计数：%d\n", auto_node_cnt);
+
+        auto_trace_running = 0;
+        auto_node_cnt = 0;
+        auto_node_lock = 0;
+
+        int current_round_before = scan_current_round;
+        start_next_trace(sockfd);
+
+        if (current_round_before < scan_total_rounds) {
+            t_stop(3000);
+            send_capture_command(sockfd, "终点", current_servo_v, servo_h_init);
+        }
+
+        node_state = NODE_STATE_IDLE;
+        return;
+    }
+
+    // 离开节点：前进250ms
+    t_up(35, 250);
+    node_state = NODE_STATE_LEAVING;
+}
+
+// 处理回程节点
+void process_backward_node(int sockfd)
+{
+    if (auto_node_cnt == 1) {
+        // 最后一个途径点
+        send_node_data(sockfd, 0x20 + auto_point_num);
+        char node_name[32];
+        snprintf(node_name, sizeof(node_name), "途径点%d", auto_point_num);
+        send_capture_command(sockfd, node_name, current_servo_v, servo_h_init);
+        printf("[TRACK_BACK] 到达途径点%d，计数：%d\n", auto_point_num, auto_node_cnt);
+    }
+    else if (auto_node_cnt >= 2 && auto_node_cnt <= auto_point_num) {
+        // 中间途径点
+        int point_num = auto_point_num - (auto_node_cnt - 1);
+        send_node_data(sockfd, 0x20 + point_num);
+        char node_name[32];
+        snprintf(node_name, sizeof(node_name), "途径点%d", point_num);
+        send_capture_command(sockfd, node_name, current_servo_v, servo_h_init);
+        printf("[TRACK_BACK] 到达途径点%d，计数：%d\n", point_num, auto_node_cnt);
+    }
+    else if (auto_node_cnt == (auto_point_num + 1)) {
+        // 起点
+        send_node_data(sockfd, 0x19);
+        send_capture_command(sockfd, "起点", current_servo_v, servo_h_init);
+        printf("[TRACK_BACK] 到达起点，计数：%d\n", auto_node_cnt);
+
+        auto_trace_running = 0;
+        auto_node_cnt = 0;
+        auto_node_lock = 0;
+
+        int current_round_before = scan_current_round;
+        start_next_trace(sockfd);
+
+        if (current_round_before < scan_total_rounds) {
+            t_stop(3000);
+            send_capture_command(sockfd, "起点", current_servo_v, servo_h_init);
+        }
+
+        node_state = NODE_STATE_IDLE;
+        return;
+    }
+
+    // 离开节点：后退250ms
+    t_down(35, 250);
+    node_state = NODE_STATE_LEAVING;
+}
+
+void trace_run_back(int sockfd)
+{
+    // 节点状态机处理
+    if (node_state != NODE_STATE_IDLE) {
+        if (process_delay()) {
+            if (node_state == NODE_STATE_WAITING) {
+                // 3秒等待完成，开始处理节点
+                node_state = NODE_STATE_PROCESS;
+                process_backward_node(sockfd);
+            }
+            else if (node_state == NODE_STATE_LEAVING) {
+                // 离开动作完成，回到空闲状态
+                node_state = NODE_STATE_IDLE;
+            }
+        }
+        return;
+    }
+
+    int B2_val, B3_val, B1_val, B4_val;
     int is_node = 0;
 
-    // 读取左右循迹传感器电平
-    SR = digitalRead(RIGHT);
-    SL = digitalRead(LEFT);
+    B2_val = digitalRead(B2);
+    B3_val = digitalRead(B3);
+    B1_val = digitalRead(B1);
+    B4_val = digitalRead(B4);
 
-    // 节点检测：两个传感器都检测到黑线（HIGH=检测到）
-    if (SL == HIGH && SR == HIGH) {
+    if (B2_val == HIGH && B3_val == HIGH && B1_val == HIGH && B4_val == HIGH) {
         is_node = 1;
     }
 
-    // 节点处理逻辑
     if (is_node && auto_node_lock == 0 && auto_trace_running) {
         auto_node_lock = 1;
         auto_node_cnt++;
 
-        // 节点处短暂停车
-        t_stop(500);
-
-        // 节点数据上报
-        if (auto_node_cnt == 1) {
-            // 起点：0x19
-            send_node_data(sockfd, 0x19);
-            printf("[TRACK] 到达起点，计数：%d\n", auto_node_cnt);
-        }
-        else if (auto_node_cnt >= 2 && auto_node_cnt <= (auto_point_num + 1)) {
-            // 途径点：0x21-0x29（对应1-9个途径点）
-            send_node_data(sockfd, 0x20 + (auto_node_cnt - 1));
-            printf("[TRACK] 到达途径点%d，计数：%d\n", auto_node_cnt - 1, auto_node_cnt);
-        }
-        else if (auto_node_cnt == (auto_point_num + 2)) {
-            // 终点：0x20
-            send_node_data(sockfd, 0x20);
-            printf("[TRACK] 到达终点，计数：%d\n", auto_node_cnt);
-            // 到达终点后自动停止循迹，恢复手动模式
-            auto_trace_running = 0;
-            control_mode = 0;
-            auto_node_cnt = 0;
-            auto_node_lock = 0;
-            t_stop(0);
-            return;
-        }
-        t_up(35, 0); // 前进200ms，强制离开节点
-        delay(250); // 节点停留时间
+        // 先停止，再等待3秒
+        t_stop(3000);
+        node_state = NODE_STATE_WAITING;
+        current_sockfd = sockfd;
+        current_node_type = 1; // 回程
+        printf("[TRACK_BACK] 到达节点，开始3秒稳定等待\n");
     }
     else if (!is_node) {
-        auto_node_lock = 0; // 离开节点，解锁计数
+        auto_node_lock = 0;
     }
 
-    // 普通循迹逻辑
-    if (auto_trace_running) {
-        if (SL == LOW && SR == LOW) {
-            // 两个传感器都在黑线上 → 直行
-            printf("[TRACK] GO\n");
-            t_up(50, 0);
+    if (auto_trace_running && node_state == NODE_STATE_IDLE) {
+        if (B2_val == HIGH && B3_val == HIGH) {
+            printf("[TRACK_BACK] BACK\n");
+            t_down(25, 0);
         }
-        else if (SL == HIGH && SR == LOW) {
-            // 左传感器离线，右传感器在线 → 左转修正
-            printf("[TRACK] LEFT\n");
-            t_left(50, 0);
+        else if (B2_val == LOW && B3_val == HIGH) {
+            printf("[TRACK_BACK] RIGHT_CORRECT\n");
+            t_right(35, 0);
         }
-        else if (SR == HIGH && SL == LOW) {
-            // 右传感器离线，左传感器在线 → 右转修正
-            printf("[TRACK] RIGHT\n");
-            t_right(50, 0);
+        else if (B2_val == HIGH && B3_val == LOW) {
+            printf("[TRACK_BACK] LEFT_CORRECT\n");
+            t_left(35, 0);
         }
         else {
-            // 两个传感器都离线 → 停止
+            printf("[TRACK_BACK] STOP\n");
+            t_stop(0);
+        }
+    }
+}
+
+void track_run(int sockfd)
+{
+    // 节点状态机处理
+    if (node_state != NODE_STATE_IDLE) {
+        if (process_delay()) {
+            if (node_state == NODE_STATE_WAITING) {
+                // 3秒等待完成，开始处理节点
+                node_state = NODE_STATE_PROCESS;
+                process_forward_node(sockfd);
+            }
+            else if (node_state == NODE_STATE_LEAVING) {
+                // 离开动作完成，回到空闲状态
+                node_state = NODE_STATE_IDLE;
+            }
+        }
+        return;
+    }
+
+    int SR, SL;
+    int is_node = 0;
+
+    SR = digitalRead(RIGHT);
+    SL = digitalRead(LEFT);
+
+    if (SL == HIGH && SR == HIGH) {
+        is_node = 1;
+    }
+
+    if (is_node && auto_node_lock == 0 && auto_trace_running) {
+        auto_node_lock = 1;
+        auto_node_cnt++;
+
+        // 非首次去程计数修正
+        if (scan_current_round > 1 && auto_node_cnt == 1) {
+            auto_node_cnt = 2;
+            printf("[TRACK] 非首次去程，自动修正计数：跳过起点，当前计数：%d\n", auto_node_cnt);
+        }
+
+        // 完全遵循原始代码逻辑：先停止，再等待3秒
+        t_stop(3000);
+        node_state = NODE_STATE_WAITING;
+        current_sockfd = sockfd;
+        current_node_type = 0; // 去程
+        printf("[TRACK] 到达节点，开始3秒稳定等待\n");
+    }
+    else if (!is_node) {
+        auto_node_lock = 0;
+    }
+
+    if (auto_trace_running && node_state == NODE_STATE_IDLE) {
+        if (SL == LOW && SR == LOW) {
+            printf("[TRACK] GO\n");
+            t_up(25, 0);
+        }
+        else if (SL == HIGH && SR == LOW) {
+            printf("[TRACK] LEFT\n");
+            t_left(35, 0);
+        }
+        else if (SR == HIGH && SL == LOW) {
+            printf("[TRACK] RIGHT\n");
+            t_right(35, 0);
+        }
+        else {
             printf("[TRACK] STOP\n");
             t_stop(0);
         }
@@ -228,26 +559,25 @@ int main(int argc, char* argv[])
     fd_set rset, allset;
     CLIENT client[FD_SETSIZE];
 
-    /*RPI初始化*/
     wiringPiSetup();
 
-    /* 1. 小车电机引脚初始化 */
-    pinMode(1, OUTPUT);	//PWMA
-    pinMode(2, OUTPUT);	//AIN2
-    pinMode(3, OUTPUT);	//AIN1
-    pinMode(4, OUTPUT);	//PWMB
-    pinMode(5, OUTPUT);	//BIN2
-    pinMode(6, OUTPUT);    //BIN1
+    pinMode(1, OUTPUT);
+    pinMode(2, OUTPUT);
+    pinMode(3, OUTPUT);
+    pinMode(4, OUTPUT);
+    pinMode(5, OUTPUT);
+    pinMode(6, OUTPUT);
 
-    /* 2. 循迹传感器引脚初始化 */
     pinMode(LEFT, INPUT);
     pinMode(RIGHT, INPUT);
+    pinMode(B2, INPUT);
+    pinMode(B3, INPUT);
+    pinMode(B1, INPUT);
+    pinMode(B4, INPUT);
 
-    /*PWM输出初始化*/
     softPwmCreate(PWMA, 0, 100);
     softPwmCreate(PWMB, 0, 100);
 
-    // 云台初始化
     int fd = pca9685Setup(PIN_BASE, 0x40, HERTZ);
     if (fd < 0)
     {
@@ -258,7 +588,6 @@ int main(int argc, char* argv[])
     PWM_write(1, lr_detection);
     PWM_write(2, qh_detection);
 
-    /* TCP服务端初始化 */
     if (argc != 2)
     {
         printf("Please add portnumber!");
@@ -274,18 +603,27 @@ int main(int argc, char* argv[])
         printf("Socket Error!");
         exit(1);
     }
+
+    // 设置端口复用
+    int opt = 1;
+    if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1)
+    {
+        printf("setsockopt Error!\n");
+        exit(1);
+    }
+
     memset(&server_addr, 0, sizeof server_addr);
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     server_addr.sin_port = htons(portnumber);
     if ((bind(listenfd, (struct sockaddr*)(&server_addr), sizeof server_addr)) == -1)
     {
-        printf("Bind Error!");
+        printf("Bind Error!\n");
         exit(1);
     }
     if (listen(listenfd, 128) == -1)
     {
-        printf("Listen Error!");
+        printf("Listen Error!\n");
         exit(1);
     }
     for (i = 0; i < FD_SETSIZE; i++)
@@ -297,24 +635,25 @@ int main(int argc, char* argv[])
     maxfd = listenfd;
     printf("waiting for the client's request...\n");
 
-    /* 主循环：处理TCP连接 + 模式切换 + 循迹逻辑 */
     while (1)
     {
         rset = allset;
         tv.tv_sec = 0;
         tv.tv_usec = 1000;
 
-        // 1. 处理TCP网络事件
         ret = select(maxfd + 1, &rset, NULL, NULL, &tv);
         if (ret == 0)
         {
-            // 无网络事件时，若处于循迹模式则执行循迹逻辑
             if (control_mode == 1)
             {
-                // 遍历所有客户端，执行循迹（仅第一个客户端有效）
                 for (i = 0; i <= maxi; i++) {
                     if (client[i].fd > 0) {
-                        track_run(client[i].fd);
+                        if (auto_mode == AUTO_MODE_GOTO_END) {
+                            track_run(client[i].fd);
+                        }
+                        else if (auto_mode == AUTO_MODE_RETURN) {
+                            trace_run_back(client[i].fd);
+                        }
                         break;
                     }
                 }
@@ -323,18 +662,17 @@ int main(int argc, char* argv[])
         }
         else if (ret < 0)
         {
-            printf("select failed!");
+            printf("select failed!\n");
             break;
         }
         else
         {
-            // 处理新TCP连接
             if (FD_ISSET(listenfd, &rset))
             {
                 len = sizeof(struct sockaddr_in);
                 if ((connectfd = accept(listenfd, (struct sockaddr*)(&client_addr), &len)) == -1)
                 {
-                    printf("accept() error");
+                    printf("accept() error\n");
                     continue;
                 }
                 for (i = 0; i < FD_SETSIZE; i++)
@@ -344,11 +682,15 @@ int main(int argc, char* argv[])
                         client[i].fd = connectfd;
                         client[i].addr = client_addr;
                         printf("Yout got a connection from %s\n", inet_ntoa(client[i].addr.sin_addr));
+
+                        set_tcp_nodelay(connectfd);
+                        global_client_fd = connectfd;
+
                         break;
                     }
                 }
                 if (i == FD_SETSIZE)
-                    printf("Overfly connections");
+                    printf("Overfly connections\n");
                 FD_SET(connectfd, &allset);
                 if (connectfd > maxfd)
                     maxfd = connectfd;
@@ -357,7 +699,6 @@ int main(int argc, char* argv[])
             }
             else
             {
-                // 处理已连接客户端的指令
                 for (i = 0; i <= maxi; i++)
                 {
                     if ((sockfd = client[i].fd) < 0)
@@ -370,18 +711,57 @@ int main(int argc, char* argv[])
                             buf[z] = '\0';
                             printf("num = %d received data:%s\n", z, buf);
 
-                            // ========== 指令解析 ==========
-                            // 设置途径点数量：SET1-SET9
                             if (strncmp(buf, "SET", 3) == 0 && z == 4) {
                                 auto_point_num = buf[3] - '0';
                                 if (auto_point_num < 1 || auto_point_num > 9) {
-                                    auto_point_num = 1; // 默认1个途径点
+                                    auto_point_num = 1;
                                 }
                                 printf("Set auto point num: %d\n", auto_point_num);
-                                write(sockfd, "SET_OK", 6);
+                                safe_send(sockfd, "SET_OK");
                                 continue;
                             }
-                            // 启动带途径点的自动循迹：TR（防止重复启动）
+
+                            if (strncmp(buf, "SCAN:", 5) == 0) {
+                                float h_init, v_init;
+                                int step, total;
+                                if (sscanf(buf, "SCAN:%f:%f:%d:%d", &h_init, &v_init, &step, &total) == 4) {
+                                    servo_h_init = max(0.0f, min(180.0f, h_init));
+                                    servo_v_init = max(0.0f, min(90.0f, v_init));
+                                    servo_v_step = max(1, min(90, step));
+                                    scan_total_rounds = max(1, total);
+                                    scan_current_round = 0;
+
+                                    printf("[SCAN] 收到扫描参数：水平%.1f°，垂直%.1f°，步长%d，总次数%d\n",
+                                        servo_h_init, servo_v_init, servo_v_step, scan_total_rounds);
+
+                                    safe_send(sockfd, "SCAN_OK");
+
+                                    start_next_trace(sockfd);
+                                }
+                                else {
+                                    safe_send(sockfd, "SCAN_ERR");
+                                    printf("[SCAN] 指令格式错误：%s\n", buf);
+                                }
+                                continue;
+                            }
+
+                            if (strcmp(buf, "SCAN_STOP") == 0) {
+                                // 立即停止所有动作和状态
+                                auto_trace_running = 0;
+                                auto_mode = AUTO_MODE_STOP;
+                                control_mode = 0;
+                                scan_current_round = 0;
+                                scan_total_rounds = 0;
+                                auto_node_cnt = 0;
+                                auto_node_lock = 0;
+                                node_state = NODE_STATE_IDLE;
+                                delay_in_progress = 0;
+                                t_stop(0);
+                                send_scan_status(sockfd, "STOPPED");
+                                printf("[SCAN] 自动扫描已停止，所有状态已重置\n");
+                                continue;
+                            }
+
                             if (strcmp(buf, "TR") == 0) {
                                 if (auto_trace_running == 1) {
                                     printf("Auto trace already running, ignore\n");
@@ -389,51 +769,53 @@ int main(int argc, char* argv[])
                                 }
 
                                 control_mode = 1;
+                                auto_mode = AUTO_MODE_GOTO_END;
                                 auto_trace_running = 1;
                                 auto_node_cnt = 0;
                                 auto_node_lock = 0;
-                                printf("Start auto trace, point num: %d\n", auto_point_num);
-                                write(sockfd, "TR_START", 8);
+                                node_state = NODE_STATE_IDLE;
+                                printf("Start auto trace (GOTO END), point num: %d\n", auto_point_num);
+                                safe_send(sockfd, "TR_START");
                                 continue;
                             }
-                            // 普通循迹模式：ONF
+
                             if (strcmp(buf, "ONF") == 0) {
                                 control_mode = 1;
-                                auto_trace_running = 0; // 无途径点计数
-                                printf("Switch to AUTO TRACK mode\n");
+                                auto_mode = AUTO_MODE_GOTO_END;
+                                auto_trace_running = 0;
+                                printf("Switch to AUTO TRACK mode (GOTO END)\n");
                                 continue;
                             }
-                            // 手动模式：ONE
                             if (strcmp(buf, "ONE") == 0) {
                                 control_mode = 0;
+                                auto_mode = AUTO_MODE_STOP;
                                 auto_trace_running = 0;
+                                scan_current_round = 0;
+                                node_state = NODE_STATE_IDLE;
                                 t_stop(0);
                                 printf("Switch to MANUAL TCP mode\n");
                                 continue;
                             }
 
-                            // ========== 云台指令解析 ==========
-                            // 1. 先处理复位指令
                             if (strcmp(buf, "SERVO:RESET") == 0) {
-                                lr_detection = 90.0f;  // 水平复位到正中间
-                                qh_detection = 0.0f;   // 垂直复位到水平位置
+                                lr_detection = 90.0f;
+                                qh_detection = 90.0f;
                                 PWM_write(1, lr_detection);
                                 PWM_write(2, qh_detection);
-                                printf("[SERVO] 云台复位成功！水平：%.1f°，垂直：%.1f°\n", lr_detection, qh_detection);
-                                write(sockfd, "SERVO_OK", 8);
+                                printf("[SERVO] 云台复位成功！\n");
+                                safe_send(sockfd, "SERVO_OK");
                                 continue;
                             }
-                            // 2. 再处理普通角度指令
                             else if (strncmp(buf, "SERVO:", 6) == 0) {
                                 char type[4], dir[10];
                                 int angle;
-                                if (sscanf(buf, "SERVO:%3[^:]:%d:%9[^:]", type, &angle, dir) == 3) {
+                                if (sscanf(buf, "SERVO:%3[^:]:%d:%9[^:]", type, &angle, &dir) == 3) {
                                     angle = max(1, min(90, angle));
                                     printf("[SERVO] 类型：%s，角度：%d，方向：%s\n", type, angle, dir);
 
                                     if (strcmp(type, "H") == 0) {
-                                        if (strcmp(dir, "LEFT") == 0) lr_detection += angle;
-                                        else if (strcmp(dir, "RIGHT") == 0) lr_detection -= angle;
+                                        if (strcmp(dir, "LEFT") == 0) lr_detection -= angle;
+                                        else if (strcmp(dir, "RIGHT") == 0) lr_detection += angle;
                                         lr_detection = max(0.0f, min(180.0f, lr_detection));
                                         PWM_write(1, lr_detection);
                                         printf("[SERVO] 水平角度：%.1f°\n", lr_detection);
@@ -441,20 +823,19 @@ int main(int argc, char* argv[])
                                     else if (strcmp(type, "V") == 0) {
                                         if (strcmp(dir, "UP") == 0) qh_detection += angle;
                                         else if (strcmp(dir, "DOWN") == 0) qh_detection -= angle;
-                                        qh_detection = max(0.0f, min(180.0f, qh_detection));
+                                        qh_detection = max(0.0f, min(90.0f, qh_detection));
                                         PWM_write(2, qh_detection);
                                         printf("[SERVO] 垂直角度：%.1f°\n", qh_detection);
                                     }
-                                    write(sockfd, "SERVO_OK", 8);
+                                    safe_send(sockfd, "SERVO_OK");
                                 }
                                 else {
-                                    write(sockfd, "SERVO_ERR", 8);
+                                    safe_send(sockfd, "SERVO_ERR");
                                     printf("[SERVO] 指令格式错误：%s\n", buf);
                                 }
                                 continue;
                             }
 
-                            // 原TCP控制逻辑（仅手动模式生效）
                             if (control_mode == 0)
                             {
                                 if (z == 3 || z == 6)
@@ -468,22 +849,22 @@ int main(int argc, char* argv[])
                                         case 'C':t_left(50, 0);    printf("left\n"); break;
                                         case 'D':t_right(50, 0);   printf("right\n"); break;
                                         case 'E':t_stop(0);       printf("stop\n"); break;
-                                        case 'L':lr_detection += 10;
+                                        case 'L':lr_detection -= 10;
                                             if (lr_detection <= 0) lr_detection = 0;
                                             if (lr_detection >= 180) lr_detection = 180;
-                                            PWM_write(1, lr_detection);  break;//左
-                                        case 'I':lr_detection -= 10;
+                                            PWM_write(1, lr_detection);  break;
+                                        case 'I':lr_detection += 10;
                                             if (lr_detection <= 0) lr_detection = 0;
                                             if (lr_detection >= 180) lr_detection = 180;
-                                            PWM_write(1, lr_detection);  break;//右
+                                            PWM_write(1, lr_detection);  break;
                                         case 'K':qh_detection += 10;
                                             if (qh_detection <= 0) qh_detection = 0;
-                                            if (qh_detection >= 180) qh_detection = 180;
-                                            PWM_write(2, qh_detection);  break;//上
+                                            if (qh_detection >= 90) qh_detection = 90;
+                                            PWM_write(2, qh_detection);  break;
                                         case 'J':qh_detection -= 10;
                                             if (qh_detection <= 0) qh_detection = 0;
-                                            if (qh_detection >= 180) qh_detection = 180;
-                                            PWM_write(2, qh_detection);  break;//下
+                                            if (qh_detection >= 90) qh_detection = 90;
+                                            PWM_write(2, qh_detection);  break;
                                         default: t_stop(0);       printf("stop\n"); break;
                                         }
                                     }
@@ -519,15 +900,23 @@ int main(int argc, char* argv[])
                         }
                         else
                         {
-                            printf("disconnected by client!");
+                            printf("disconnected by client!\n");
                             close(sockfd);
                             FD_CLR(sockfd, &allset);
                             client[i].fd = -1;
-                            // 客户端断开后重置循迹状态
+                            global_client_fd = -1;
                             control_mode = 0;
+                            auto_mode = AUTO_MODE_STOP;
                             auto_trace_running = 0;
                             auto_node_cnt = 0;
                             auto_node_lock = 0;
+                            scan_current_round = 0;
+                            scan_total_rounds = 0;
+                            node_state = NODE_STATE_IDLE;
+                            delay_in_progress = 0;
+
+                            // 提示重启mjpg-streamer以清理缓冲区
+                            printf("[INFO] 客户端已断开，下次连接前建议重启mjpg-streamer\n");
                         }
                     }
                 }
