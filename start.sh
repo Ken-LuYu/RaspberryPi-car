@@ -92,14 +92,7 @@ export LD_LIBRARY_PATH="$(pwd)"
 #export LD_LIBRARY_PATH="$(pwd)"
 #./mjpg_streamer -i "./input_uvc.so -d /dev/video0 -r 360*360 -f 15 -n -ex auto -br 45 -con 50 -sat 45 -sharp 50" -o "./output_http.so -w ./www -p 8080"
 
-# ======================================
-# 最终启动命令（完整保留你的2560x1440配置）
-# ======================================
 
-# ✅ 完整保留你原来的所有参数：-n -f 20 -r 2560x1440 -ex auto -br 45
-# ✅ 新增优化：-q 75（JPEG质量75%，内存占用减少60%，画质几乎无损失）
-# ✅ 新增优化：-p 8080 明确指定端口
-# ✅ 后台运行+日志输出
 ./mjpg_streamer \
   -i "./input_uvc.so -n -f 20 -r 2560x1440 -ex auto -br 45 -q 75" \
   -o "./output_http.so -w ./www -p 8080" \
